@@ -1,9 +1,10 @@
 use std::hash::{Hash, Hasher};
 
+use qtbridge::QModelItem;
 use zbus::{OwnedObjectPath, proxy};
 
 #[allow(dead_code)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, QModelItem)]
 pub struct Unit {
     pub name: String,
     pub description: String,
@@ -11,10 +12,10 @@ pub struct Unit {
     pub active_state: String,
     pub sub_state: String,
     pub followed_unit: String,
-    pub unit_object_path: OwnedObjectPath,
+    pub unit_object_path: String,
     pub job_id: u32,
     pub job_type: String,
-    pub job_object_path: OwnedObjectPath
+    pub job_object_path: String,
 }
 
 #[proxy(

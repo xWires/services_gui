@@ -1,258 +1,199 @@
 mod dbus;
+mod qt;
 
-use std::error::Error;
-use iced::futures::{SinkExt, Stream, StreamExt};
-use iced::{Element, Length, Subscription, Task, stream};
-use iced::widget::{button, center, column, container, scrollable, table, text};
-use iced_aw::ContextMenu;
+use std::{cell::RefCell, rc::Rc};
+
+use futures_util::stream::StreamExt;
+use qtbridge::{QApp, QmlObject, qobject};
 use zbus::Connection;
 
-use crate::dbus::{HashableManagerProxy, ManagerProxy, Unit};
+use crate::{dbus::{ManagerProxy, Unit}, qt::UnitTableModel};
 
-enum Status {
-    Loading,
-
-    Loaded(State),
-    Failed(String)
+#[derive(Default)]
+struct Backend {
+    manager_proxy: Option<ManagerProxy<'static>>,
+    units: Rc<RefCell<UnitTableModel>>
 }
 
-struct App {
-    proxy: Option<ManagerProxy<'static>>,
-    status: Status
-}
+#[qobject(Singleton)]
+impl Backend {
+    qproperty!("units", Member = units, Notify = units_changed);
 
-#[derive(Debug, Clone)]
-enum Message {
-    DbusConnected(Result<ManagerProxy<'static>, zbus::Error>),
+    #[qsignal]
+    fn units_changed(&mut self);
 
-    JobRemoved,
+    #[qslot]
+    fn init(&self) {
+        println!("Connecting to D-Bus");
 
-    RefreshUnits,
-    LoadedUnits(Result<Vec<Unit>, zbus::Error>),
-
-    StartUnit(String),
-    UnitStarted(Result<(), zbus::Error>),
-
-    StopUnit(String),
-    UnitStopped(Result<(), zbus::Error>),
-
-    RestartUnit(String),
-    UnitRestarted(Result<(), zbus::Error>)
-}
-
-struct State {
-    units: Vec<Unit>
-}
-
-impl App {
-    fn new() -> (Self, Task<Message>) {
-        (
-            Self { proxy: None, status: Status::Loading },
-            Task::perform(dbus_connect(), Message::DbusConnected)
-        )
-    }
-
-    fn update(&mut self, message: Message) -> Task<Message> {
-        match message {
-            Message::DbusConnected(Ok(proxy)) => {
-                println!("D-Bus connected");
-                self.proxy = Some(proxy);
-                self.update(Message::RefreshUnits)
-            },
-            Message::DbusConnected(Err(e)) => {
-                eprintln!("Failed to connect to D-Bus: {:?}", e);
-                self.status = Status::Failed(e.to_string());
-                Task::none()
-            },
-
-            Message::JobRemoved => self.update(Message::RefreshUnits),
-
-            Message::RefreshUnits => match &self.proxy {
-                Some(proxy) => {
-                    println!("Refreshing units");
-                    Task::perform(get_units(proxy.clone()), Message::LoadedUnits)
-                },
-                // This can only be reached if the initial connection failed
-                None => {
-                    self.status = Status::Loading;
-                    Task::perform(dbus_connect(), Message::DbusConnected)
-                }
-            },
-            Message::LoadedUnits(Ok(units)) => {
-                println!("Loaded units");
-                self.status = Status::Loaded(State { units });
-                Task::none()
-            }
-            Message::LoadedUnits(Err(e)) => {
-                eprintln!("Failed to load units: {:?}", e);
-                self.status = Status::Failed(e.to_string());
-                Task::none()
-            }
-
-            Message::StartUnit(name) => match self.proxy.clone() {
-                Some(proxy) => {
-                    println!("Starting unit: {}", name);
-                    Task::perform(start_unit(proxy, name), Message::UnitStarted)
-                },
-                None => Task::none(),
-            },
-            Message::UnitStarted(Ok(_)) => self.update(Message::RefreshUnits),
-            Message::UnitStarted(Err(e)) => {
-                eprintln!("Failed to start unit: {:?}", e);
-                Task::none()
-            },
-
-            Message::StopUnit(name) => match self.proxy.clone() {
-                Some(proxy) => {
-                    println!("Stopping unit: {}", name);
-                    Task::perform(stop_unit(proxy, name), Message::UnitStopped)
-                },
-                None => Task::none(),
-            },
-            Message::UnitStopped(Ok(_)) => self.update(Message::RefreshUnits),
-            Message::UnitStopped(Err(e)) => {
-                eprintln!("Failed to stop unit: {:?}", e);
-                Task::none()
-            },
-
-            Message::RestartUnit(name) => match self.proxy.clone() {
-                Some(proxy) => {
-                    println!("Restarting unit: {}", name);
-                    Task::perform(restart_unit(proxy, name), Message::UnitRestarted)
-                },
-                None => Task::none(),
-            },
-            Message::UnitRestarted(Ok(_)) => self.update(Message::RefreshUnits),
-            Message::UnitRestarted(Err(e)) => {
-                eprintln!("Failed to restart unit: {:?}", e);
-                Task::none()
-            },
-        }
-    }
-
-    fn view(&self) -> Element<'_, Message> {
-        match &self.status {
-            Status::Loading => center(text("Loading services...")).into(),
-            Status::Failed(e) => {
-                center(column![
-                    text(format!("Failed to load units: {e}")),
-                    button("Try again").on_press(Message::RefreshUnits)
-                ]).into()
-            },
-            Status::Loaded(state) => {
-                let columns = vec![
-                    table::column(text("Name"), |row: Unit| ContextMenu::new(text(row.name.clone()), move || {
-                        let mut start = button("Start").width(Length::Fill);
-                        let mut stop = button("Stop").width(Length::Fill);
-                        let mut restart = button("Restart").width(Length::Fill);
-
-                        if row.active_state != "active".to_string() {
-                            start = start.on_press(Message::StartUnit(row.name.clone()));
-                        } else {
-                            stop = stop.on_press(Message::StopUnit(row.name.clone()));
-                            restart = restart.on_press(Message::RestartUnit(row.name.clone()));
-                        }
-
-                        container(
-                            column![
-                                start,
-                                stop,
-                                restart
-                            ]
-                        )
-                        .width(Length::Fixed(128.0))
-                        .style(container::primary)
-                        .into()
-                    })),
-                    table::column(text("Description"), |row: Unit| text(row.description)),
-                    table::column(text("State"), |row: Unit| text(row.active_state))
-                ];
-
-                let services_table = table(columns, state.units.clone());
-
-                column![
-                    button("Refresh").on_press(Message::RefreshUnits),
-                    scrollable(services_table),
-                ].into()
-            }
-        }
-    }
-
-    fn subscription(&self) -> Subscription<Message> {
-        match &self.proxy {
-            Some(proxy) => Subscription::run_with(HashableManagerProxy(proxy.clone()), signal_listener),
-            None => Subscription::none()
-        }
-    }
-}
-
-// The `use<>` here tells the compiler that the generic data returned does not borrow from the arguments
-fn signal_listener(proxy: &HashableManagerProxy) -> impl Stream<Item = Message> + use<> {
-    let proxy = proxy.0.clone();
-    stream::channel(100, async move |mut output| {
-        let mut stream = proxy.receive_job_removed().await.unwrap();
-        while let Some(signal) = stream.next().await {
-            let args = match signal.args() {
-                Ok(a) => a,
+        let handle = self.get_thread_handle();
+        tokio::spawn(async move {
+            let conn = match Connection::system().await {
+                Ok(c) => c,
                 Err(e) => {
-                    eprintln!("Failed to get args from signal: {:?}", e);
-                    continue;
-                }
+                    eprintln!("Failed to connect to D-Bus: {:?}", e);
+                    return;
+                },
             };
 
-            println!("{:?}", args);
-            // It doesn't matter too much if the message fails to send, so just ignore the result
-            let _ = output.send(Message::JobRemoved).await;
-        }
-    })
+            let proxy = match ManagerProxy::new(&conn).await {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to create proxy: {:?}", e);
+                    return;
+                },
+            };
+
+            println!("D-Bus connected");
+            handle.invoke_mut(move |backend| {
+                backend.manager_proxy = Some(proxy);
+                backend.reload_units();
+                backend.start_job_listener();
+            });
+        });
+    }
+    
+    #[qslot]
+    fn start_job_listener(&self) {
+        let proxy = self.manager_proxy.clone().unwrap();
+        let handle = self.get_thread_handle();
+        tokio::spawn(async move {
+            let mut stream = proxy.receive_job_removed().await.unwrap();
+            while let Some(signal) = stream.next().await {
+                let args = match signal.args() {
+                    Ok(a) => a,
+                    Err(e) => {
+                        eprintln!("Failed to get args from signal: {:?}", e);
+                        continue;
+                    }
+                };
+
+                println!("{:?}", args);
+
+                handle.invoke(move |backend| {
+                    backend.reload_units();
+                });
+            }
+        });
+    }
+
+    #[qslot]
+    fn reload_units(&self) {
+        println!("Reloading units");
+
+        let proxy = self.manager_proxy.clone().unwrap();
+        let handle = self.get_thread_handle();
+        tokio::spawn(async move {
+            let list = match proxy.list_units().await {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Failed to list units: {:?}", e);
+                    return;
+                },
+            };
+
+            let mut units = list
+                .into_iter()
+                .map(|u| Unit {
+                    name: u.0,
+                    description: u.1,
+                    load_state: u.2,
+                    active_state: u.3,
+                    sub_state: u.4,
+                    followed_unit: u.5,
+                    unit_object_path: u.6.to_string(),
+                    job_id: u.7,
+                    job_type: u.8,
+                    job_object_path: u.9.to_string()
+                }).collect::<Vec<_>>();
+            units.sort_by_key(|u| u.name.clone());
+
+            handle.invoke_mut(move |backend| {
+                println!("Loaded {} units", units.len());
+                backend.units = Rc::new(RefCell::new(UnitTableModel(units)));
+                backend.units_changed();
+            });
+        });
+    }
+
+    #[qslot]
+    fn can_start(&self, row: usize) -> bool {
+        self.units.borrow().0.get(row).is_some_and(|u| u.active_state == "inactive")
+    }
+
+    #[qslot]
+    fn start_unit(&self, row: usize) {
+        let unit = match self.units.borrow().0.get(row) {
+            Some(u) => u.clone(),
+            None => {
+                eprintln!("Tried to start unit at row {} but it does not exist in units list", row);
+                return;
+            },
+        };
+
+        let proxy = self.manager_proxy.clone().unwrap();
+        let handle = self.get_thread_handle();
+        tokio::spawn(async move {
+            if proxy.start_unit(unit.name, "replace".to_string()).await.is_ok() {
+                handle.invoke(move |backend| {
+                    backend.reload_units();
+                });
+            }
+        });
+    }
+
+    #[qslot]
+    fn can_stop(&self, row: usize) -> bool {
+        self.units.borrow().0.get(row).is_some_and(|u| u.active_state == "active")
+    }
+
+    #[qslot]
+    fn stop_unit(&self, row: usize) {
+        let unit = match self.units.borrow().0.get(row) {
+            Some(u) => u.clone(),
+            None => {
+                eprintln!("Tried to stop unit at row {} but it does not exist in units list", row);
+                return;
+            },
+        };
+
+        let proxy = self.manager_proxy.clone().unwrap();
+        let handle = self.get_thread_handle();
+        tokio::spawn(async move {
+            if proxy.stop_unit(unit.name, "replace".to_string()).await.is_ok() {
+                handle.invoke(move |backend| {
+                    backend.reload_units();
+                });
+            }
+        });
+    }
+
+    #[qslot]
+    fn restart_unit(&self, row: usize) {
+        let unit = match self.units.borrow().0.get(row) {
+            Some(u) => u.clone(),
+            None => {
+                eprintln!("Tried to restart unit at row {} but it does not exist in units list", row);
+                return;
+            },
+        };
+
+        let proxy = self.manager_proxy.clone().unwrap();
+        let handle = self.get_thread_handle();
+        tokio::spawn(async move {
+            if proxy.restart_unit(unit.name, "replace".to_string()).await.is_ok() {
+                handle.invoke(move |backend| {
+                    backend.reload_units();
+                });
+            }
+        });
+    }
 }
 
-async fn dbus_connect() -> Result<ManagerProxy<'static>, zbus::Error> {
-    let conn = Connection::system().await?;
-    ManagerProxy::new(&conn).await
-}
-
-async fn get_units(proxy: ManagerProxy<'_>) -> Result<Vec<Unit>, zbus::Error> {
-    let mut units = proxy
-        .list_units()
-        .await?
-        .into_iter()
-        .map(|u| Unit {
-            name: u.0,
-            description: u.1,
-            load_state: u.2,
-            active_state: u.3,
-            sub_state: u.4,
-            followed_unit: u.5,
-            unit_object_path: u.6,
-            job_id: u.7,
-            job_type: u.8,
-            job_object_path: u.9
-        }).collect::<Vec<_>>();
-    units.sort_by_key(|u| u.name.clone());
-
-    Ok(units)
-}
-
-async fn start_unit(proxy: ManagerProxy<'_>, name: String) -> Result<(), zbus::Error> {
-    proxy.start_unit(name, "replace".to_string()).await?;
-    Ok(())
-}
-
-async fn stop_unit(proxy: ManagerProxy<'_>, name: String) -> Result<(), zbus::Error> {
-    proxy.stop_unit(name, "replace".to_string()).await?;
-    Ok(())
-}
-
-async fn restart_unit(proxy: ManagerProxy<'_>, name: String) -> Result<(), zbus::Error> {
-    proxy.restart_unit(name, "replace".to_string()).await?;
-    Ok(())
-}
-
-fn main() -> Result<(), Box<dyn Error>> {
-    iced::application(App::new, App::update, App::view)
-        .title("Services")
-        .subscription(App::subscription)
-        .run()?;
-    Ok(())
+#[tokio::main]
+async fn main() {
+    QApp::new()
+        .register::<Backend>()
+        .load_qml(include_bytes!("qml/Main.qml"))
+        .run();
 }
