@@ -39,7 +39,7 @@ ApplicationWindow {
             }
 
             Label {
-                text: "<a href=\"https://github.com/xWires/services-gui\">https://github.com/xWires/services-gui</a>"
+                text: "<a href=\"https://github.com/xWires/services_gui\">https://github.com/xWires/services_gui</a>"
                 onLinkActivated: (link) => Qt.openUrlExternally(link)
                 HoverHandler {
                     enabled: parent.hoveredLink
