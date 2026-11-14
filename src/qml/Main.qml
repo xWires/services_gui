@@ -29,6 +29,7 @@ ApplicationWindow {
         anchors.centerIn: Overlay.overlay
         width: Math.min(400, parent.width - 40)
         standardButtons: Dialog.Close
+        popupType: Popup.Window
 
         ColumnLayout {
             anchors.fill: parent
